@@ -15,12 +15,9 @@ reasoning, novel architecture, or touches anything irreversible.
 
 ## Preflight
 
-```bash
-foreman up          # idempotent; prints the running version
-```
-
-If `foreman` is missing, say so and stop — do not fall back to editing the
-files yourself without telling the user.
+None. `foreman` starts and reuses its own server. If the `foreman` command
+itself is missing, say so and stop — do not quietly fall back to editing the
+files yourself.
 
 ## The loop
 

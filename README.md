@@ -12,11 +12,13 @@ V4 (or Kimi, GLM, Qwen, Grok) at subscription prices, while Claude Code, Codex,
 or a shell script stays the orchestrator.
 
 ```bash
-foreman up
 foreman dispatch --worktree --deny 'apps/worker/**' "Add retry with backoff to the HTTP client."
 foreman ls        # t1  running  opencode-go/deepseek-v4-pro  Add retry with backoff…
 foreman diff t1   # review before anything lands on your branch
 ```
+
+There is no server to start first — `foreman` brings one up the moment it needs
+one.
 
 ## Why this exists instead of a plugin
 
@@ -38,14 +40,30 @@ provider authenticated (`opencode auth login`).
 ```bash
 git clone https://github.com/takeshita-0x0201/opencode-foreman
 ln -s "$PWD/opencode-foreman/foreman" ~/.local/bin/foreman
-foreman up
 ```
+
+## Running the server
+
+`opencode serve` is a background HTTP server, but you never have to think about
+it. Any command that needs it starts it on demand and reuses it afterwards, so
+one server serves every task, every repo, and every terminal.
+
+If you would rather have it always resident — surviving reboots and crashes:
+
+```bash
+foreman agent install     # launchd on macOS, systemd --user on Linux
+foreman agent status
+foreman agent uninstall
+```
+
+`foreman up` / `foreman down` remain for starting and stopping it by hand.
+Set `FOREMAN_AUTOSTART=0` if you want an unstarted server to be an error
+instead of a launch.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `foreman up` / `down` | Start / stop the headless `opencode serve` process |
 | `foreman dispatch "<task>"` | Create a session and fire `prompt_async`; returns immediately |
 | `foreman ls` | All tasks with live `running` / `starting` / `idle` state |
 | `foreman wait <id>` | Block until the session goes idle |
@@ -55,6 +73,8 @@ foreman up
 | `foreman abort <id>` | Stop a running session |
 | `foreman revert <id>` | Ask OpenCode to roll back its own edits |
 | `foreman clean <id>` | Remove the worktree and forget the task |
+| `foreman up` / `down` | Start / stop the server by hand |
+| `foreman agent install` / `uninstall` / `status` | Keep the server resident across reboots |
 
 `dispatch` flags worth knowing:
 
@@ -141,7 +161,13 @@ Claude-specific.
   `git add -AN` so new files show up).
 - Right after dispatch a session is briefly absent from `/session/status`.
   `foreman` reports `starting` for 5 seconds rather than a misleading `idle`.
-- `foreman down` only stops a server that `foreman up` started.
+- `foreman down` only stops a server that `foreman` itself started, and refuses
+  while `agent install` is active — launchd would just restart it.
+- After `agent install`, killing the server looks like KeepAlive is broken for
+  about ten seconds. It isn't: launchd throttles restarts. Wait, then re-check.
+- The server runs unsecured unless `OPENCODE_SERVER_PASSWORD` is set (it logs a
+  warning saying so). It binds `127.0.0.1`, so the exposure is to other
+  processes on the same machine — worth a password if that matters to you.
 
 Verified against opencode 1.18.10 on macOS. Issues and PRs welcome.
 

@@ -38,6 +38,11 @@ DEFAULT_PROFILE = "pro"
 # Seconds after dispatch during which "not busy" means "has not started yet".
 STARTUP_GRACE = 5.0
 
+# Commands that talk to the server; these autostart it if it is not running.
+# `diff` and `clean` only touch git, so they work with the server down.
+NEEDS_SERVER = {"dispatch", "ls", "status", "wait", "result", "perms", "reply",
+                "abort", "revert"}
+
 
 # --------------------------------------------------------------------------
 # tiny HTTP client
@@ -188,40 +193,78 @@ def make_worktree(repo: str, name: str) -> str:
 # commands
 # --------------------------------------------------------------------------
 
-def cmd_up(args):
-    base = args.url
-    health = None
+def probe_health(base: str, timeout: int = 3):
+    """Health check that answers None instead of exiting."""
     try:
-        health = request("GET", "/global/health", base=base, timeout=3)
-    except SystemExit:
-        health = None
-    if health:
-        print(f"already running: opencode {health.get('version')} at {base}")
-        return
+        req = urllib.request.Request(base.rstrip("/") + "/global/health")
+        password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+        if password:
+            import base64
+            user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+            token = base64.b64encode(f"{user}:{password}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def is_local(base: str) -> bool:
+    return (urllib.parse.urlparse(base).hostname or "") in ("127.0.0.1", "localhost", "::1")
+
+
+def server_port(base: str) -> int:
+    return urllib.parse.urlparse(base).port or 4096
+
+
+def start_server(base: str, announce: bool = True):
     if not shutil.which("opencode"):
         die("opencode is not on PATH (https://opencode.ai)")
-    port = urllib.parse.urlparse(base).port or 4096
     os.makedirs(STATE_DIR, exist_ok=True)
     log = open(os.path.join(STATE_DIR, "server.log"), "ab")
     proc = subprocess.Popen(
-        ["opencode", "serve", "--port", str(port), "--hostname", "127.0.0.1"],
+        ["opencode", "serve", "--port", str(server_port(base)), "--hostname", "127.0.0.1"],
         stdout=log, stderr=log, start_new_session=True,
     )
     with open(PID_FILE, "w") as handle:
         handle.write(str(proc.pid))
     for _ in range(40):
         time.sleep(0.5)
-        try:
-            health = request("GET", "/global/health", base=base, timeout=2)
-        except SystemExit:
-            continue
+        health = probe_health(base, timeout=2)
         if health:
-            print(f"started: opencode {health.get('version')} at {base} (pid {proc.pid})")
-            return
+            if announce:
+                print(f"started opencode {health.get('version')} at {base} "
+                      f"(pid {proc.pid})", file=sys.stderr)
+            return health
     die("server did not become healthy in 20s; see " + os.path.join(STATE_DIR, "server.log"))
 
 
+def ensure_server(base: str):
+    """Bring the server up on demand, so no command ever has to be preceded
+    by `foreman up`. Set FOREMAN_AUTOSTART=0 to require an explicit start."""
+    if probe_health(base):
+        return
+    if os.environ.get("FOREMAN_AUTOSTART", "1") == "0":
+        die(f"no opencode server at {base} and FOREMAN_AUTOSTART=0")
+    if not is_local(base):
+        die(f"no opencode server at {base}; it is remote, start it there")
+    start_server(base)
+
+
+def cmd_up(args):
+    health = probe_health(args.url)
+    if health:
+        print(f"already running: opencode {health.get('version')} at {args.url}")
+        return
+    start_server(args.url, announce=False)
+    health = probe_health(args.url)
+    print(f"started: opencode {health.get('version')} at {args.url}")
+
+
 def cmd_down(args):
+    if agent_installed():
+        die(f"{AGENT_LABEL} is installed and will restart the server; "
+            "run `foreman agent uninstall` instead")
     try:
         with open(PID_FILE) as handle:
             pid = int(handle.read().strip())
@@ -233,6 +276,119 @@ def cmd_down(args):
     except ProcessLookupError:
         print(f"pid {pid} was not running")
     os.remove(PID_FILE)
+
+
+# --------------------------------------------------------------------------
+# persistent background service (launchd on macOS, systemd --user on Linux)
+# --------------------------------------------------------------------------
+
+AGENT_LABEL = "ai.opencode.foreman"
+PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT_LABEL}.plist")
+UNIT_PATH = os.path.expanduser("~/.config/systemd/user/opencode-foreman.service")
+
+
+def agent_installed() -> bool:
+    return os.path.exists(PLIST_PATH if sys.platform == "darwin" else UNIT_PATH)
+
+
+def cmd_agent_install(args):
+    opencode = shutil.which("opencode") or die("opencode is not on PATH")
+    port = server_port(args.url)
+    log = os.path.join(STATE_DIR, "server.log")
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    if sys.platform == "darwin":
+        os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{opencode}</string>
+    <string>serve</string>
+    <string>--port</string><string>{port}</string>
+    <string>--hostname</string><string>127.0.0.1</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{os.environ.get('PATH', '/usr/bin:/bin')}</string></dict>
+</dict>
+</plist>
+"""
+        with open(PLIST_PATH, "w") as handle:
+            handle.write(plist)
+        uid = os.getuid()
+        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGENT_LABEL}"],
+                       capture_output=True)
+        proc = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", PLIST_PATH],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            die(f"launchctl bootstrap failed: {proc.stderr.strip()}")
+        print(f"installed {PLIST_PATH}")
+    else:
+        os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+        unit = f"""[Unit]
+Description=opencode headless server (foreman)
+
+[Service]
+ExecStart={opencode} serve --port {port} --hostname 127.0.0.1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"""
+        with open(UNIT_PATH, "w") as handle:
+            handle.write(unit)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+        proc = subprocess.run(
+            ["systemctl", "--user", "enable", "--now", "opencode-foreman"],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            die(f"systemctl failed: {proc.stderr.strip()}")
+        print(f"installed {UNIT_PATH}")
+
+    for _ in range(30):
+        time.sleep(0.5)
+        health = probe_health(args.url, timeout=2)
+        if health:
+            print(f"opencode {health.get('version')} is up at {args.url} "
+                  "and will restart on reboot")
+            return
+    die(f"service installed but not healthy yet; check {log}")
+
+
+def cmd_agent_uninstall(args):
+    if sys.platform == "darwin":
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                       capture_output=True)
+        if os.path.exists(PLIST_PATH):
+            os.remove(PLIST_PATH)
+            print(f"removed {PLIST_PATH}")
+        else:
+            print("no launch agent installed")
+    else:
+        subprocess.run(["systemctl", "--user", "disable", "--now", "opencode-foreman"],
+                       capture_output=True)
+        if os.path.exists(UNIT_PATH):
+            os.remove(UNIT_PATH)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+            print(f"removed {UNIT_PATH}")
+        else:
+            print("no systemd unit installed")
+
+
+def cmd_agent_status(args):
+    health = probe_health(args.url)
+    print(f"server:  {'up (opencode ' + str(health.get('version')) + ')' if health else 'down'} at {args.url}")
+    print(f"service: {'installed' if agent_installed() else 'not installed'}"
+          + (f" ({PLIST_PATH if sys.platform == 'darwin' else UNIT_PATH})"
+             if agent_installed() else ""))
 
 
 def cmd_dispatch(args):
@@ -487,7 +643,15 @@ def main():
     r.add_argument("response", choices=["once", "always", "reject"])
     r.set_defaults(fn=cmd_reply)
 
+    agent = sub.add_parser("agent", help="run the server permanently in the background")
+    agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)
+    agent_sub.add_parser("install", help="start on login and restart on crash").set_defaults(fn=cmd_agent_install)
+    agent_sub.add_parser("uninstall", help="remove the background service").set_defaults(fn=cmd_agent_uninstall)
+    agent_sub.add_parser("status", help="is the server up, is the service installed").set_defaults(fn=cmd_agent_status)
+
     args = parser.parse_args()
+    if args.cmd in NEEDS_SERVER:
+        ensure_server(args.url)
     args.fn(args)
 
 
