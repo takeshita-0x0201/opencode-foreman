@@ -501,19 +501,42 @@ def cmd_status(args):
     raise SystemExit(0 if state == "idle" else 2)
 
 
+def has_replied(url: str, task: dict) -> bool:
+    """True once the executor has produced an assistant message.
+
+    Authoritative "it really ran", as opposed to the time-based grace period,
+    which only exists because /session/status lags prompt_async.
+    """
+    messages = request("GET", f"/session/{task['session']}/message",
+                       query={"directory": task["dir"]}, base=url) or []
+    return any(m.get("info", {}).get("role") == "assistant" for m in messages)
+
+
 def cmd_wait(args):
     task = resolve(args.task)
     deadline = time.time() + args.timeout
+    started = time.time()
+    seen_busy = False
+    delay = 0.3
     while time.time() < deadline:
-        if task_state(args.url, task) == "idle":
-            pending = pending_permissions(args.url, task["session"])
-            if pending:
-                print(f"blocked on {len(pending)} permission request(s): "
-                      f"foreman perms {task['id']}", file=sys.stderr)
-                raise SystemExit(3)
-            print("idle")
-            return
-        time.sleep(3)
+        if session_busy(args.url, task["dir"], task["session"]):
+            seen_busy = True
+        else:
+            # Finished if we watched it run, or it already answered, or the
+            # startup lag window has passed with nothing happening.
+            if seen_busy or has_replied(args.url, task) \
+                    or time.time() - started > STARTUP_GRACE:
+                pending = pending_permissions(args.url, task["session"])
+                if pending:
+                    print(f"blocked on {len(pending)} permission request(s): "
+                          f"foreman perms {task['id']}", file=sys.stderr)
+                    raise SystemExit(3)
+                print("idle")
+                return
+        # Poll tightly at first so short tasks are not padded by the interval,
+        # then back off so long ones are not a busy-loop.
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5.0)
     die(f"still running after {args.timeout}s", code=4)
 
 

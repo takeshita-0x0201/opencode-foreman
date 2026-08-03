@@ -42,6 +42,33 @@ git clone https://github.com/takeshita-0x0201/opencode-foreman
 ln -s "$PWD/opencode-foreman/foreman" ~/.local/bin/foreman
 ```
 
+## Do you actually need this?
+
+Often not. `opencode run "..."` already runs the agent in-process — it opens no
+socket and needs no server — and for a single sequential task it is the simpler
+tool. Measured on a trivial task: `opencode run` ~3.0s, `foreman dispatch
+--wait` ~2.7s. **The server buys no speed.**
+
+What it buys is control that `opencode run` has no way to express:
+
+| | `opencode run` | server API |
+| --- | --- | --- |
+| Per-**task** permission ruleset | ✗ (only `--auto`) | ✓ |
+| Project-wide permissions | ✓ via `opencode.json` | ✓ |
+| Non-blocking dispatch | ✗ blocks | ✓ `prompt_async` |
+| Status / abort a live run | ✗ | ✓ |
+| Roll back the agent's edits | ✗ | ✓ `revert` |
+| Inspect messages, diff, todo, fork | limited | ✓ |
+
+`opencode.json` can already deny `edit` or `bash` — but for the whole project,
+for every session. Running two tasks side by side in one repo where one may
+write `apps/web` and the other is read-only requires a ruleset attached to the
+session, and that only exists on the API.
+
+So: reach for `opencode run` for one-off work. Reach for this when you are
+fanning out tasks with different blast radii and want to review each diff
+before it lands.
+
 ## Running the server
 
 `opencode serve` is a background HTTP server, but you never have to think about
