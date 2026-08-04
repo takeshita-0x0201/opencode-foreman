@@ -75,21 +75,14 @@ before it lands.
 
 ## Running the server
 
-`opencode serve` is a background HTTP server, but you never have to think about
-it. Any command that needs it starts it on demand and reuses it afterwards, so
-one server serves every task, every repo, and every terminal.
+You never have to think about it. Any command that needs `opencode serve`
+starts it on demand and reuses it, so one server covers every task, repo, and
+terminal. `foreman down` stops it; `FOREMAN_AUTOSTART=0` turns a missing server
+into an error instead of a launch.
 
-If you would rather have it always resident — surviving reboots and crashes:
-
-```bash
-foreman agent install     # launchd on macOS, systemd --user on Linux
-foreman agent status
-foreman agent uninstall
-```
-
-`foreman up` / `foreman down` remain for starting and stopping it by hand.
-Set `FOREMAN_AUTOSTART=0` if you want an unstarted server to be an error
-instead of a launch.
+If you want it resident across reboots, write a launchd plist or a systemd user
+unit for `opencode serve --port 4096` — that is your init system's job, not
+this tool's.
 
 ## Commands
 
@@ -100,14 +93,13 @@ instead of a launch.
 | `foreman wait <id>` | Block until the session goes idle |
 | `foreman result <id>` | The executor's final message |
 | `foreman verify <id>` | Run the task's acceptance checks; non-zero if any fail |
-| `foreman escalate <id>` | Re-run the same brief one rung up the model ladder |
 | `foreman diff <id>` | `git diff` of what it changed |
-| `foreman perms <id>` / `reply <id> <req> once\|always\|reject` | Answer a permission prompt without a TUI |
 | `foreman abort <id>` | Stop a running session |
-| `foreman revert <id>` | Ask OpenCode to roll back its own edits |
 | `foreman clean <id>` | Remove the worktree and forget the task |
-| `foreman up` / `down` | Start / stop the server by hand |
-| `foreman agent install` / `uninstall` / `status` | Keep the server resident across reboots |
+| `foreman down` | Stop the server |
+
+That is the whole surface. Everything the OpenCode API can do that this does
+not is [documented](docs/api-notes.md) so you can call it directly.
 
 `dispatch` flags worth knowing:
 
@@ -141,14 +133,14 @@ $ foreman dispatch --check 'test -f calc.py' \
 1/2 passed
 ```
 
-`foreman escalate` re-runs the same brief one rung up — and that example is
-exactly when **not** to use it. The prompt asked for `add`; the criterion
-demanded `factorial`. Escalating reproduced the identical failure on
-`deepseek-v4-pro`, at higher cost. A stronger model cannot read a requirement
-that was never written.
+Re-dispatching that at `--profile pro` produced the identical failure at higher
+cost. The prompt asked for `add`; the criterion demanded `factorial`. **A
+stronger model cannot read a requirement that was never written.**
 
-Diagnose first: a **spec defect** means fix the brief and re-dispatch at the
-same rung; only a genuine **capability limit** is worth a rung.
+So diagnose before you reach for a bigger rung. A **spec defect** means fix the
+brief and re-dispatch where you are. Only a genuine **capability limit** — a
+complete spec the model still could not satisfy — is worth `--profile` one step
+up.
 
 ## Parallelism
 
@@ -222,13 +214,14 @@ Claude-specific.
   `git add -AN` so new files show up).
 - Right after dispatch a session is briefly absent from `/session/status`.
   `foreman` reports `starting` for 5 seconds rather than a misleading `idle`.
-- `foreman down` only stops a server that `foreman` itself started, and refuses
-  while `agent install` is active — launchd would just restart it.
-- After `agent install`, killing the server looks like KeepAlive is broken for
-  about ten seconds. It isn't: launchd throttles restarts. Wait, then re-check.
+- `foreman down` only stops a server that `foreman` itself started.
 - The server runs unsecured unless `OPENCODE_SERVER_PASSWORD` is set (it logs a
   warning saying so). It binds `127.0.0.1`, so the exposure is to other
   processes on the same machine — worth a password if that matters to you.
+- `foreman` never emits an `ask` permission rule, only `allow`/`deny`, so a
+  session cannot stall waiting for a human. If your project `opencode.json`
+  sets `ask`, a run can block; the API routes for answering that are in
+  [docs/api-notes.md](docs/api-notes.md).
 
 Verified against opencode 1.18.10 on macOS. Issues and PRs welcome.
 

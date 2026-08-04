@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""foreman - dispatch implementation work to OpenCode over its server API.
+"""foreman - dispatch spec'd implementation work to OpenCode, then verify it.
 
-Your orchestrator (Claude Code, Codex, a shell script, you) stays in charge.
-OpenCode runs the executor model in a headless server, one session per task,
-each scoped to its own directory or git worktree.
+Your orchestrator keeps the plan and the verdict. An OpenCode model writes the
+code, in its own git worktree, under write rules the server enforces. Nothing
+is believed until its acceptance checks pass.
 
 Standard library only. No dependencies.
 """
@@ -29,8 +29,7 @@ TASKS_FILE = os.path.join(STATE_DIR, "tasks.json")
 PID_FILE = os.path.join(STATE_DIR, "server.pid")
 WORKTREE_DIR = os.path.join(STATE_DIR, "worktrees")
 
-# Escalation ladder. `foreman escalate` re-runs a failed task at the next rung
-# with the same brief, so stepping up is a decision, not a rewrite.
+# Rungs, weakest first. Escalating is re-dispatching at the next one.
 LADDER = ["flash", "pro", "max"]
 PROFILES = {
     "flash": ("opencode-go", "deepseek-v4-flash"),   # bulk, mechanical, search
@@ -42,15 +41,27 @@ DEFAULT_PROFILE = "pro"
 # Seconds after dispatch during which "not busy" means "has not started yet".
 STARTUP_GRACE = 5.0
 
-# Commands that talk to the server; these autostart it if it is not running.
-# `diff` and `clean` only touch git, so they work with the server down.
-NEEDS_SERVER = {"dispatch", "ls", "status", "wait", "result", "perms", "reply",
-                "abort", "revert", "escalate"}
+# Commands that talk to the server. `diff`, `verify` and `clean` do not.
+NEEDS_SERVER = {"dispatch", "ls", "wait", "result", "abort"}
+
+
+def die(message: str, code: int = 1):
+    print(f"foreman: {message}", file=sys.stderr)
+    raise SystemExit(code)
 
 
 # --------------------------------------------------------------------------
-# tiny HTTP client
+# HTTP
 # --------------------------------------------------------------------------
+
+def auth_header(req: urllib.request.Request):
+    password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+    if password:
+        import base64
+        user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
+
 
 def request(method: str, path: str, *, query: dict | None = None,
             body: dict | None = None, base: str = DEFAULT_URL, timeout: int = 600):
@@ -61,20 +72,14 @@ def request(method: str, path: str, *, query: dict | None = None,
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("Content-Type", "application/json")
-    password = os.environ.get("OPENCODE_SERVER_PASSWORD")
-    if password:
-        import base64
-        user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
-        token = base64.b64encode(f"{user}:{password}".encode()).decode()
-        req.add_header("Authorization", f"Basic {token}")
+    auth_header(req)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:500]
-        die(f"{method} {path} -> HTTP {exc.code}: {detail}")
+        die(f"{method} {path} -> HTTP {exc.code}: {exc.read().decode(errors='replace')[:500]}")
     except urllib.error.URLError as exc:
-        die(f"cannot reach opencode server at {base} ({exc.reason}). Run: foreman up")
+        die(f"cannot reach opencode server at {base} ({exc.reason})")
     if not raw.strip():
         return None
     try:
@@ -83,9 +88,61 @@ def request(method: str, path: str, *, query: dict | None = None,
         return raw
 
 
-def die(message: str, code: int = 1):
-    print(f"foreman: {message}", file=sys.stderr)
-    raise SystemExit(code)
+# --------------------------------------------------------------------------
+# server lifecycle - started on demand, never by hand
+# --------------------------------------------------------------------------
+
+def probe_health(base: str, timeout: int = 3):
+    try:
+        req = urllib.request.Request(base.rstrip("/") + "/global/health")
+        auth_header(req)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def ensure_server(base: str):
+    if probe_health(base):
+        return
+    if os.environ.get("FOREMAN_AUTOSTART", "1") == "0":
+        die(f"no opencode server at {base} and FOREMAN_AUTOSTART=0")
+    if (urllib.parse.urlparse(base).hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+        die(f"no opencode server at {base}; it is remote, start it there")
+    if not shutil.which("opencode"):
+        die("opencode is not on PATH (https://opencode.ai)")
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log = open(os.path.join(STATE_DIR, "server.log"), "ab")
+    proc = subprocess.Popen(
+        ["opencode", "serve", "--port", str(urllib.parse.urlparse(base).port or 4096),
+         "--hostname", "127.0.0.1"],
+        stdout=log, stderr=log, start_new_session=True,
+    )
+    with open(PID_FILE, "w") as handle:
+        handle.write(str(proc.pid))
+    for _ in range(40):
+        time.sleep(0.5)
+        health = probe_health(base, timeout=2)
+        if health:
+            print(f"started opencode {health.get('version')} at {base} (pid {proc.pid})",
+                  file=sys.stderr)
+            return
+    die("server did not become healthy in 20s; see " + os.path.join(STATE_DIR, "server.log"))
+
+
+def cmd_down(args):
+    try:
+        with open(PID_FILE) as handle:
+            pid = int(handle.read().strip())
+    except (FileNotFoundError, ValueError):
+        die("no server pid recorded (foreman did not start it)")
+    try:
+        os.kill(pid, 15)
+        print(f"stopped pid {pid}")
+    except ProcessLookupError:
+        print(f"pid {pid} was not running")
+    os.remove(PID_FILE)
 
 
 # --------------------------------------------------------------------------
@@ -109,7 +166,6 @@ def save_tasks(tasks: dict):
 
 
 def resolve(ref: str) -> dict:
-    """Look up a task by short id, or by session id, or 'last'."""
     tasks = load_tasks()
     if not tasks:
         die("no tasks recorded yet")
@@ -118,13 +174,13 @@ def resolve(ref: str) -> dict:
     if ref in tasks:
         return tasks[ref]
     for task in tasks.values():
-        if task["session"] == ref or task["session"].endswith(ref):
+        if task["session"].endswith(ref):
             return task
     die(f"unknown task {ref!r} (try: foreman ls)")
 
 
 def next_id(tasks: dict) -> str:
-    used = {int(k[1:]) for k in tasks if k.startswith("t") and k[1:].isdigit()}
+    used = {int(k[1:]) for k in tasks if k[1:].isdigit()}
     n = 1
     while n in used:
         n += 1
@@ -134,12 +190,10 @@ def next_id(tasks: dict) -> str:
 # --------------------------------------------------------------------------
 # permission rules
 #
-# Verified against opencode 1.18.10. Two silent footguns, see docs/api-notes.md:
-#   - the permission NAME must be "edit"; "write" is accepted and ignored.
-#   - the pattern matcher does not honour "**/dir/**" or absolute prefixes.
-#     Only substring-style globs ("*dir*") actually match.
-# Passing an unenforced rule fails open, so we normalize instead of trusting
-# whatever the caller typed.
+# Verified against opencode 1.18.10; see docs/api-notes.md. Two rule forms are
+# accepted and silently ignored: the permission name must be "edit" (not the
+# tool name "write"), and the matcher does not honour "**/dir/**" or absolute
+# prefixes. Both fail open, so normalize rather than trust what was typed.
 # --------------------------------------------------------------------------
 
 def normalize_pattern(pattern: str) -> str:
@@ -151,24 +205,23 @@ def normalize_pattern(pattern: str) -> str:
         while core.endswith(suffix):
             core = core[: -len(suffix)]
     core = core.strip("/")
-    if not core:
-        return "**"
-    return f"*{core}*"
+    return f"*{core}*" if core else "**"
 
 
 def build_ruleset(deny: list[str], allow_bash: bool, read_only: bool) -> list[dict]:
-    rules: list[dict] = []
+    rules = []
     if read_only:
         rules.append({"permission": "edit", "pattern": "**", "action": "deny"})
     if not allow_bash:
         rules.append({"permission": "bash", "pattern": "**", "action": "deny"})
     for pattern in deny:
-        rules.append({"permission": "edit", "pattern": normalize_pattern(pattern), "action": "deny"})
+        rules.append({"permission": "edit", "pattern": normalize_pattern(pattern),
+                      "action": "deny"})
     return rules
 
 
 # --------------------------------------------------------------------------
-# git helpers
+# git
 # --------------------------------------------------------------------------
 
 def git(*args, cwd: str, check: bool = True) -> str:
@@ -179,17 +232,12 @@ def git(*args, cwd: str, check: bool = True) -> str:
 
 
 def make_worktree(repo: str, name: str) -> str:
-    if not os.path.isdir(os.path.join(repo, ".git")) and not git(
-        "rev-parse", "--git-dir", cwd=repo, check=False
-    ):
-        die(f"{repo} is not a git repository; use --dir without --worktree")
     root = git("rev-parse", "--show-toplevel", cwd=repo).strip()
     os.makedirs(WORKTREE_DIR, exist_ok=True)
     path = os.path.join(WORKTREE_DIR, name)
     if os.path.exists(path):
         die(f"worktree {path} already exists (foreman clean it first)")
-    branch = f"foreman/{name}"
-    git("worktree", "add", "-b", branch, path, "HEAD", cwd=root)
+    git("worktree", "add", "-b", f"foreman/{name}", path, "HEAD", cwd=root)
     return path
 
 
@@ -197,209 +245,8 @@ def make_worktree(repo: str, name: str) -> str:
 # commands
 # --------------------------------------------------------------------------
 
-def probe_health(base: str, timeout: int = 3):
-    """Health check that answers None instead of exiting."""
-    try:
-        req = urllib.request.Request(base.rstrip("/") + "/global/health")
-        password = os.environ.get("OPENCODE_SERVER_PASSWORD")
-        if password:
-            import base64
-            user = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
-            token = base64.b64encode(f"{user}:{password}".encode()).decode()
-            req.add_header("Authorization", f"Basic {token}")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
-    except Exception:
-        return None
-
-
-def is_local(base: str) -> bool:
-    return (urllib.parse.urlparse(base).hostname or "") in ("127.0.0.1", "localhost", "::1")
-
-
-def server_port(base: str) -> int:
-    return urllib.parse.urlparse(base).port or 4096
-
-
-def start_server(base: str, announce: bool = True):
-    if not shutil.which("opencode"):
-        die("opencode is not on PATH (https://opencode.ai)")
-    os.makedirs(STATE_DIR, exist_ok=True)
-    log = open(os.path.join(STATE_DIR, "server.log"), "ab")
-    proc = subprocess.Popen(
-        ["opencode", "serve", "--port", str(server_port(base)), "--hostname", "127.0.0.1"],
-        stdout=log, stderr=log, start_new_session=True,
-    )
-    with open(PID_FILE, "w") as handle:
-        handle.write(str(proc.pid))
-    for _ in range(40):
-        time.sleep(0.5)
-        health = probe_health(base, timeout=2)
-        if health:
-            if announce:
-                print(f"started opencode {health.get('version')} at {base} "
-                      f"(pid {proc.pid})", file=sys.stderr)
-            return health
-    die("server did not become healthy in 20s; see " + os.path.join(STATE_DIR, "server.log"))
-
-
-def ensure_server(base: str):
-    """Bring the server up on demand, so no command ever has to be preceded
-    by `foreman up`. Set FOREMAN_AUTOSTART=0 to require an explicit start."""
-    if probe_health(base):
-        return
-    if os.environ.get("FOREMAN_AUTOSTART", "1") == "0":
-        die(f"no opencode server at {base} and FOREMAN_AUTOSTART=0")
-    if not is_local(base):
-        die(f"no opencode server at {base}; it is remote, start it there")
-    start_server(base)
-
-
-def cmd_up(args):
-    health = probe_health(args.url)
-    if health:
-        print(f"already running: opencode {health.get('version')} at {args.url}")
-        return
-    start_server(args.url, announce=False)
-    health = probe_health(args.url)
-    print(f"started: opencode {health.get('version')} at {args.url}")
-
-
-def cmd_down(args):
-    if agent_installed():
-        die(f"{AGENT_LABEL} is installed and will restart the server; "
-            "run `foreman agent uninstall` instead")
-    try:
-        with open(PID_FILE) as handle:
-            pid = int(handle.read().strip())
-    except (FileNotFoundError, ValueError):
-        die("no server pid recorded (foreman did not start it)")
-    try:
-        os.kill(pid, 15)
-        print(f"stopped pid {pid}")
-    except ProcessLookupError:
-        print(f"pid {pid} was not running")
-    os.remove(PID_FILE)
-
-
-# --------------------------------------------------------------------------
-# persistent background service (launchd on macOS, systemd --user on Linux)
-# --------------------------------------------------------------------------
-
-AGENT_LABEL = "ai.opencode.foreman"
-PLIST_PATH = os.path.expanduser(f"~/Library/LaunchAgents/{AGENT_LABEL}.plist")
-UNIT_PATH = os.path.expanduser("~/.config/systemd/user/opencode-foreman.service")
-
-
-def agent_installed() -> bool:
-    return os.path.exists(PLIST_PATH if sys.platform == "darwin" else UNIT_PATH)
-
-
-def cmd_agent_install(args):
-    opencode = shutil.which("opencode") or die("opencode is not on PATH")
-    port = server_port(args.url)
-    log = os.path.join(STATE_DIR, "server.log")
-    os.makedirs(STATE_DIR, exist_ok=True)
-
-    if sys.platform == "darwin":
-        os.makedirs(os.path.dirname(PLIST_PATH), exist_ok=True)
-        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{AGENT_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>{opencode}</string>
-    <string>serve</string>
-    <string>--port</string><string>{port}</string>
-    <string>--hostname</string><string>127.0.0.1</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{log}</string>
-  <key>StandardErrorPath</key><string>{log}</string>
-  <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{os.environ.get('PATH', '/usr/bin:/bin')}</string></dict>
-</dict>
-</plist>
-"""
-        with open(PLIST_PATH, "w") as handle:
-            handle.write(plist)
-        uid = os.getuid()
-        subprocess.run(["launchctl", "bootout", f"gui/{uid}/{AGENT_LABEL}"],
-                       capture_output=True)
-        proc = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", PLIST_PATH],
-                              capture_output=True, text=True)
-        if proc.returncode != 0:
-            die(f"launchctl bootstrap failed: {proc.stderr.strip()}")
-        print(f"installed {PLIST_PATH}")
-    else:
-        os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
-        unit = f"""[Unit]
-Description=opencode headless server (foreman)
-
-[Service]
-ExecStart={opencode} serve --port {port} --hostname 127.0.0.1
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=default.target
-"""
-        with open(UNIT_PATH, "w") as handle:
-            handle.write(unit)
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-        proc = subprocess.run(
-            ["systemctl", "--user", "enable", "--now", "opencode-foreman"],
-            capture_output=True, text=True)
-        if proc.returncode != 0:
-            die(f"systemctl failed: {proc.stderr.strip()}")
-        print(f"installed {UNIT_PATH}")
-
-    for _ in range(30):
-        time.sleep(0.5)
-        health = probe_health(args.url, timeout=2)
-        if health:
-            print(f"opencode {health.get('version')} is up at {args.url} "
-                  "and will restart on reboot")
-            return
-    die(f"service installed but not healthy yet; check {log}")
-
-
-def cmd_agent_uninstall(args):
-    if sys.platform == "darwin":
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
-                       capture_output=True)
-        if os.path.exists(PLIST_PATH):
-            os.remove(PLIST_PATH)
-            print(f"removed {PLIST_PATH}")
-        else:
-            print("no launch agent installed")
-    else:
-        subprocess.run(["systemctl", "--user", "disable", "--now", "opencode-foreman"],
-                       capture_output=True)
-        if os.path.exists(UNIT_PATH):
-            os.remove(UNIT_PATH)
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-            print(f"removed {UNIT_PATH}")
-        else:
-            print("no systemd unit installed")
-
-
-def cmd_agent_status(args):
-    health = probe_health(args.url)
-    print(f"server:  {'up (opencode ' + str(health.get('version')) + ')' if health else 'down'} at {args.url}")
-    print(f"service: {'installed' if agent_installed() else 'not installed'}"
-          + (f" ({PLIST_PATH if sys.platform == 'darwin' else UNIT_PATH})"
-             if agent_installed() else ""))
-
-
 def cmd_dispatch(args):
-    prompt = args.prompt
-    if args.file:
-        with open(args.file) as handle:
-            prompt = handle.read()
+    prompt = open(args.file).read() if args.file else args.prompt
     if not prompt or not prompt.strip():
         die("empty prompt")
 
@@ -413,36 +260,26 @@ def cmd_dispatch(args):
     source = os.path.abspath(args.dir)
     tasks = load_tasks()
     task_id = next_id(tasks)
-    name = args.worktree if args.worktree else None
-    if name is True or args.worktree == "":
-        name = task_id
+    name = task_id if args.worktree == "" else args.worktree
     workdir = make_worktree(source, name) if name else source
 
     ruleset = build_ruleset(args.deny, args.allow_bash, args.read_only)
-    payload = {"title": args.title or prompt.strip().splitlines()[0][:60]}
+    title = prompt.strip().splitlines()[0][:60]
+    payload = {"title": title}
     if ruleset:
         payload["permission"] = ruleset
 
-    session = request("POST", "/session", query={"directory": workdir},
-                      body=payload, base=args.url)
-    sid = session["id"]
-
+    sid = request("POST", "/session", query={"directory": workdir},
+                  body=payload, base=args.url)["id"]
     request("POST", f"/session/{sid}/prompt_async", query={"directory": workdir},
-            body={
-                "model": {"providerID": provider, "modelID": model},
-                "parts": [{"type": "text", "text": prompt}],
-                **({"agent": args.agent} if args.agent else {}),
-            },
+            body={"model": {"providerID": provider, "modelID": model},
+                  "parts": [{"type": "text", "text": prompt}]},
             base=args.url)
 
     tasks[task_id] = {
         "id": task_id, "session": sid, "dir": workdir, "source": source,
-        "worktree": name, "model": f"{provider}/{model}",
-        "profile": args.profile if not args.model else None,
-        "title": payload["title"], "created": time.time(),
-        "permission": ruleset, "prompt": prompt, "checks": list(args.check),
-        "deny": list(args.deny), "allow_bash": args.allow_bash,
-        "read_only": args.read_only,
+        "worktree": name, "model": f"{provider}/{model}", "title": title,
+        "created": time.time(), "checks": list(args.check),
     }
     save_tasks(tasks)
 
@@ -450,48 +287,42 @@ def cmd_dispatch(args):
     print(f"  model     {provider}/{model}")
     print(f"  dir       {workdir}")
     if ruleset:
-        print(f"  denied    " + ", ".join(f"{r['permission']}:{r['pattern']}" for r in ruleset))
+        print("  denied    " + ", ".join(f"{r['permission']}:{r['pattern']}" for r in ruleset))
     if args.check:
         print(f"  checks    {len(args.check)} acceptance command(s)")
     else:
-        print("  checks    none - nothing will verify this task's output",
-              file=sys.stderr)
+        print("  checks    none - nothing will verify this task's output", file=sys.stderr)
+
     if args.wait:
         cmd_wait(argparse.Namespace(url=args.url, task=task_id, timeout=args.timeout))
         cmd_result(argparse.Namespace(url=args.url, task=task_id))
         if args.check:
-            cmd_verify(argparse.Namespace(url=args.url, task=task_id))
+            cmd_verify(argparse.Namespace(task=task_id))
 
 
-def session_busy(url: str, workdir: str, sid: str) -> bool:
-    status = request("GET", "/session/status", query={"directory": workdir}, base=url) or {}
-    return sid in status
+def session_busy(url: str, task: dict) -> bool:
+    status = request("GET", "/session/status", query={"directory": task["dir"]},
+                     base=url) or {}
+    return task["session"] in status
+
+
+def has_replied(url: str, task: dict) -> bool:
+    messages = request("GET", f"/session/{task['session']}/message",
+                       query={"directory": task["dir"]}, base=url) or []
+    return any(m.get("info", {}).get("role") == "assistant" for m in messages)
 
 
 def task_state(url: str, task: dict) -> str:
     """running | starting | idle.
 
-    prompt_async returns before the session shows up in /session/status, so a
-    freshly dispatched task reads as idle for a second or two. Reporting that
-    as "idle" makes callers collect an empty result and move on.
+    /session/status lags prompt_async, so a freshly dispatched task reads as
+    not-busy for a moment. Calling that "idle" makes callers collect nothing.
     """
-    if session_busy(url, task["dir"], task["session"]):
+    if session_busy(url, task):
         return "running"
-    if time.time() - task["created"] < STARTUP_GRACE:
+    if time.time() - task["created"] < STARTUP_GRACE and not has_replied(url, task):
         return "starting"
     return "idle"
-
-
-def pending_permissions(url: str, sid: str) -> list:
-    """Permission requests waiting on a human.
-
-    Only the v2 route lists these. The v1 path /session/{id}/permission answers
-    200 with a non-JSON body, which is easy to mistake for "nothing pending".
-    """
-    body = request("GET", f"/api/session/{sid}/permission", base=url)
-    if isinstance(body, dict):
-        return body.get("data") or []
-    return []
 
 
 def cmd_ls(args):
@@ -499,56 +330,22 @@ def cmd_ls(args):
     if not tasks:
         print("no tasks")
         return
-    print(f"{'ID':<5} {'STATE':<9} {'MODEL':<28} TITLE")
+    print(f"{'ID':<5} {'STATE':<9} {'CHK':<4} {'MODEL':<28} TITLE")
     for task in sorted(tasks.values(), key=lambda t: t["created"]):
-        try:
-            state = task_state(args.url, task)
-        except SystemExit:
-            state = "?"
-        print(f"{task['id']:<5} {state:<9} {task['model']:<28} {task['title'][:50]}")
-
-
-def cmd_status(args):
-    task = resolve(args.task)
-    state = task_state(args.url, task)
-    print(state)
-    raise SystemExit(0 if state == "idle" else 2)
-
-
-def has_replied(url: str, task: dict) -> bool:
-    """True once the executor has produced an assistant message.
-
-    Authoritative "it really ran", as opposed to the time-based grace period,
-    which only exists because /session/status lags prompt_async.
-    """
-    messages = request("GET", f"/session/{task['session']}/message",
-                       query={"directory": task["dir"]}, base=url) or []
-    return any(m.get("info", {}).get("role") == "assistant" for m in messages)
+        state = task_state(args.url, task)
+        checks = str(len(task.get("checks") or []))
+        print(f"{task['id']:<5} {state:<9} {checks:<4} {task['model']:<28} {task['title'][:44]}")
 
 
 def cmd_wait(args):
     task = resolve(args.task)
     deadline = time.time() + args.timeout
-    started = time.time()
-    seen_busy = False
     delay = 0.3
     while time.time() < deadline:
-        if session_busy(args.url, task["dir"], task["session"]):
-            seen_busy = True
-        else:
-            # Finished if we watched it run, or it already answered, or the
-            # startup lag window has passed with nothing happening.
-            if seen_busy or has_replied(args.url, task) \
-                    or time.time() - started > STARTUP_GRACE:
-                pending = pending_permissions(args.url, task["session"])
-                if pending:
-                    print(f"blocked on {len(pending)} permission request(s): "
-                          f"foreman perms {task['id']}", file=sys.stderr)
-                    raise SystemExit(3)
-                print("idle")
-                return
-        # Poll tightly at first so short tasks are not padded by the interval,
-        # then back off so long ones are not a busy-loop.
+        if task_state(args.url, task) == "idle":
+            print("idle")
+            return
+        # Tight at first so short tasks are not padded, then back off.
         time.sleep(delay)
         delay = min(delay * 1.5, 5.0)
     die(f"still running after {args.timeout}s", code=4)
@@ -558,29 +355,26 @@ def cmd_result(args):
     task = resolve(args.task)
     messages = request("GET", f"/session/{task['session']}/message",
                        query={"directory": task["dir"]}, base=args.url) or []
-    texts = [
-        part.get("text", "")
-        for message in messages
-        if message.get("info", {}).get("role") == "assistant"
-        for part in message.get("parts", [])
-        if part.get("type") == "text" and part.get("text")
-    ]
+    texts = [part.get("text", "")
+             for message in messages
+             if message.get("info", {}).get("role") == "assistant"
+             for part in message.get("parts", [])
+             if part.get("type") == "text" and part.get("text")]
     print(texts[-1] if texts else "(no assistant text)")
 
 
 def cmd_diff(args):
     task = resolve(args.task)
-    # The API's /session/{id}/diff omitted newly created untracked files in
-    # testing, so read the truth from git. intent-to-add surfaces new files in
-    # the diff without staging their contents.
+    # The API's /session/{id}/diff omitted untracked new files in testing, so
+    # read the truth from git. intent-to-add surfaces them without staging.
     git("add", "-AN", ".", cwd=task["dir"], check=False)
     out = git("diff", cwd=task["dir"], check=False)
     print(out if out.strip() else "(no changes)")
 
 
 def cmd_verify(args):
-    """Run the task's acceptance checks. The executor's 'Done.' is a claim;
-    this is the evidence. Exits non-zero if any check fails."""
+    """Run the acceptance checks. The executor's 'Done.' is a claim; this is
+    the evidence. Non-zero exit if any check fails."""
     task = resolve(args.task)
     checks = task.get("checks") or []
     if not checks:
@@ -593,57 +387,11 @@ def cmd_verify(args):
         print(f"[{'PASS' if ok else 'FAIL'}] {command}")
         if not ok:
             failed.append(command)
-            tail = (proc.stdout + proc.stderr).strip().splitlines()
-            for line in tail[-8:]:
+            for line in (proc.stdout + proc.stderr).strip().splitlines()[-8:]:
                 print(f"       {line}")
     print(f"{len(checks) - len(failed)}/{len(checks)} passed")
     if failed:
-        print(f"escalate with: foreman escalate {task['id']}", file=sys.stderr)
         raise SystemExit(1)
-
-
-def cmd_escalate(args):
-    """Re-dispatch a task's brief at the next rung of the ladder.
-
-    Deliberately reuses the recorded prompt: if the brief was the problem,
-    fix the brief and dispatch again instead of escalating a bad spec.
-    """
-    task = resolve(args.task)
-    profile = task.get("profile")
-    if not profile:
-        die(f"{task['id']} pinned --model explicitly; re-dispatch with the model you want")
-    if profile not in LADDER:
-        die(f"unknown profile {profile!r}")
-    index = LADDER.index(profile)
-    if index + 1 >= len(LADDER):
-        die(f"{profile} is the top rung; hand this back to the orchestrator")
-    nxt = LADDER[index + 1]
-    print(f"escalating {task['id']}: {profile} -> {nxt}", file=sys.stderr)
-    cmd_dispatch(argparse.Namespace(
-        url=args.url, prompt=task["prompt"], file=None, dir=task["source"],
-        worktree=f"{task['id']}-{nxt}", profile=nxt, model=None, agent=None,
-        title=f"[{nxt}] {task['title']}", deny=task.get("deny", []),
-        read_only=task.get("read_only", False),
-        allow_bash=task.get("allow_bash", False),
-        check=task.get("checks", []), wait=args.wait, timeout=args.timeout,
-    ))
-
-
-def cmd_perms(args):
-    task = resolve(args.task)
-    pending = pending_permissions(args.url, task["session"])
-    if not pending:
-        print("no pending permission requests")
-        return
-    for item in pending:
-        print(json.dumps(item, indent=2))
-
-
-def cmd_reply(args):
-    task = resolve(args.task)
-    request("POST", f"/api/session/{task['session']}/permission/{args.request_id}/reply",
-            body={"reply": args.response}, base=args.url)
-    print(f"replied {args.response}")
 
 
 def cmd_abort(args):
@@ -651,13 +399,6 @@ def cmd_abort(args):
     request("POST", f"/session/{task['session']}/abort",
             query={"directory": task["dir"]}, base=args.url)
     print("aborted")
-
-
-def cmd_revert(args):
-    task = resolve(args.task)
-    request("POST", f"/session/{task['session']}/revert",
-            query={"directory": task["dir"]}, body={}, base=args.url)
-    print("reverted (opencode rolled back its own edits)")
 
 
 def cmd_clean(args):
@@ -677,74 +418,48 @@ def cmd_clean(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="foreman",
-        description="Dispatch implementation work to OpenCode over its server API.",
-    )
-    parser.add_argument("--url", default=DEFAULT_URL, help=f"server base URL (default {DEFAULT_URL})")
+        description="Dispatch spec'd implementation work to OpenCode, then verify it.")
+    parser.add_argument("--url", default=DEFAULT_URL)
     sub = parser.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("up", help="start the headless opencode server if it is not running").set_defaults(fn=cmd_up)
-    sub.add_parser("down", help="stop the server foreman started").set_defaults(fn=cmd_down)
 
     d = sub.add_parser("dispatch", help="send a task to an executor session")
     d.add_argument("prompt", nargs="?", help="the task, self-contained")
     d.add_argument("-f", "--file", help="read the prompt from a file instead")
-    d.add_argument("--dir", default=".", help="repository or directory to work in")
-    d.add_argument("--worktree", nargs="?", const="", default=None,
-                   metavar="NAME", help="run in an isolated git worktree (default name: task id)")
-    d.add_argument("--profile", choices=LADDER, default=DEFAULT_PROFILE,
-                   help=f"ladder rung: {' -> '.join(LADDER)} (default {DEFAULT_PROFILE})")
+    d.add_argument("--dir", default=".", help="repository to work in")
+    d.add_argument("--worktree", nargs="?", const="", default=None, metavar="NAME",
+                   help="run in an isolated git worktree (default name: task id)")
     d.add_argument("--check", action="append", default=[], metavar="CMD",
                    help="acceptance command; must exit 0 (repeatable)")
-    d.add_argument("--model", help="explicit provider/model, overrides --profile")
-    d.add_argument("--agent", help="opencode agent to use")
-    d.add_argument("--title", help="short label for foreman ls")
+    d.add_argument("--profile", choices=LADDER, default=DEFAULT_PROFILE,
+                   help=f"ladder rung: {' -> '.join(LADDER)} (default {DEFAULT_PROFILE})")
+    d.add_argument("--model", help="pin provider/model, overrides --profile")
     d.add_argument("--deny", action="append", default=[], metavar="PATH",
                    help="deny edits under this path (repeatable)")
     d.add_argument("--read-only", action="store_true", help="deny all edits")
     d.add_argument("--allow-bash", action="store_true",
                    help="permit shell commands (denied by default)")
-    d.add_argument("--wait", action="store_true", help="block until done, then print the result")
-    d.add_argument("--timeout", type=int, default=1800, help="seconds for --wait (default 1800)")
+    d.add_argument("--wait", action="store_true",
+                   help="block, print the result, then run the checks")
+    d.add_argument("--timeout", type=int, default=1800)
     d.set_defaults(fn=cmd_dispatch)
 
-    sub.add_parser("ls", help="list tasks and whether they are still running").set_defaults(fn=cmd_ls)
+    sub.add_parser("ls", help="tasks, live state, and how many checks each carries"
+                   ).set_defaults(fn=cmd_ls)
+    sub.add_parser("down", help="stop the server foreman started").set_defaults(fn=cmd_down)
 
     for name, fn, helptext in [
-        ("status", cmd_status, "exit 0 if idle, 2 if still running"),
-        ("result", cmd_result, "print the executor's final message"),
+        ("wait", cmd_wait, "block until the session goes idle"),
+        ("result", cmd_result, "the executor's final message"),
         ("diff", cmd_diff, "git diff of what the executor changed"),
-        ("verify", cmd_verify, "run the task's acceptance checks"),
-        ("perms", cmd_perms, "list pending permission requests"),
+        ("verify", cmd_verify, "run the acceptance checks"),
         ("abort", cmd_abort, "stop a running session"),
-        ("revert", cmd_revert, "ask opencode to roll back its edits"),
         ("clean", cmd_clean, "remove the worktree and forget the task"),
     ]:
         p = sub.add_parser(name, help=helptext)
         p.add_argument("task", nargs="?", default="last", help="task id (default: last)")
+        if name == "wait":
+            p.add_argument("--timeout", type=int, default=1800)
         p.set_defaults(fn=fn)
-
-    w = sub.add_parser("wait", help="block until the session goes idle")
-    w.add_argument("task", nargs="?", default="last")
-    w.add_argument("--timeout", type=int, default=1800)
-    w.set_defaults(fn=cmd_wait)
-
-    r = sub.add_parser("reply", help="answer a pending permission request")
-    r.add_argument("task")
-    r.add_argument("request_id")
-    r.add_argument("response", choices=["once", "always", "reject"])
-    r.set_defaults(fn=cmd_reply)
-
-    e = sub.add_parser("escalate", help="re-run a task's brief at the next ladder rung")
-    e.add_argument("task", nargs="?", default="last")
-    e.add_argument("--wait", action="store_true")
-    e.add_argument("--timeout", type=int, default=1800)
-    e.set_defaults(fn=cmd_escalate)
-
-    agent = sub.add_parser("agent", help="run the server permanently in the background")
-    agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)
-    agent_sub.add_parser("install", help="start on login and restart on crash").set_defaults(fn=cmd_agent_install)
-    agent_sub.add_parser("uninstall", help="remove the background service").set_defaults(fn=cmd_agent_uninstall)
-    agent_sub.add_parser("status", help="is the server up, is the service installed").set_defaults(fn=cmd_agent_status)
 
     args = parser.parse_args()
     if args.cmd in NEEDS_SERVER:

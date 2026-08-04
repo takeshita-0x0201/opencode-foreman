@@ -77,10 +77,9 @@ responses:
   again at the same rung.** Escalating will reproduce the same failure at
   higher cost; a stronger model cannot read a requirement that is not there.
 - **Capability limit** — the spec was complete and the model still could not
-  do it. Then, and only then: `foreman escalate <id>` re-runs the same brief
-  one rung up.
+  do it. Then, and only then, re-dispatch the same brief at the next rung.
 
-Escalate at most once per task. If `max` fails on a complete spec, the task is
+Step up at most once per task. If `max` fails on a complete spec, the task is
 mis-decomposed — take it back and split it, or implement it yourself.
 
 ## Step 5 — land or discard
@@ -89,8 +88,6 @@ mis-decomposed — take it back and split it, or implement it yourself.
 - Fail: `foreman clean <id>` discards the worktree and branch. Prefer
   re-dispatching over hand-patching — patching the output leaves the defective
   spec in place, and you will hit it again next task.
-- `foreman revert <id>` rolls back the executor's edits without touching the
-  task record.
 
 ## Reporting
 
