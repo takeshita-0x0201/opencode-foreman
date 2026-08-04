@@ -12,9 +12,13 @@ V4 (or Kimi, GLM, Qwen, Grok) at subscription prices, while Claude Code, Codex,
 or a shell script stays the orchestrator.
 
 ```bash
-foreman dispatch --worktree --deny 'apps/worker/**' "Add retry with backoff to the HTTP client."
-foreman ls        # t1  running  opencode-go/deepseek-v4-pro  Add retry with backoff…
-foreman diff t1   # review before anything lands on your branch
+foreman dispatch --worktree --deny 'apps/worker/**' \
+  --check 'python3 -m pytest tests/test_retry.py -q' \
+  "Add retry with exponential backoff to the HTTP client in src/http.py …"
+
+foreman ls          # t1  running  opencode-go/deepseek-v4-pro  Add retry…
+foreman verify t1   # runs the acceptance checks — evidence, not the model's word
+foreman diff t1     # review before anything lands on your branch
 ```
 
 There is no server to start first — `foreman` brings one up the moment it needs
@@ -95,6 +99,8 @@ instead of a launch.
 | `foreman ls` | All tasks with live `running` / `starting` / `idle` state |
 | `foreman wait <id>` | Block until the session goes idle |
 | `foreman result <id>` | The executor's final message |
+| `foreman verify <id>` | Run the task's acceptance checks; non-zero if any fail |
+| `foreman escalate <id>` | Re-run the same brief one rung up the model ladder |
 | `foreman diff <id>` | `git diff` of what it changed |
 | `foreman perms <id>` / `reply <id> <req> once\|always\|reject` | Answer a permission prompt without a TUI |
 | `foreman abort <id>` | Stop a running session |
@@ -111,10 +117,38 @@ instead of a launch.
   server, not by prompt wording.
 - `--read-only` — analysis only.
 - `--allow-bash` — shell is **denied by default**; opt in per task.
-- `--profile pro|flash` — `deepseek-v4-pro` (implementation) or
-  `deepseek-v4-flash` (search, classification, bulk mechanical work).
-- `--model provider/model` — anything `opencode models` lists.
-- `--wait` — dispatch synchronously and print the result.
+- `--check 'CMD'` (repeatable) — an acceptance criterion. Must exit 0.
+- `--profile flash|pro|max` — ladder rungs: `deepseek-v4-flash` (bulk,
+  mechanical, search) → `deepseek-v4-pro` (default) → `grok-4.5` (hardest).
+- `--model provider/model` — pin any of the 18 OpenCode Go models directly;
+  `opencode models` lists them.
+- `--wait` — dispatch synchronously, print the result, then run the checks.
+
+## Specs, not vibes
+
+A task with no `--check` cannot be verified, so `dispatch` says so on stderr.
+The criteria are what let a cheap model be trusted: it is not judgment that
+makes the output safe, it is that you can prove the output meets a bar you set
+in advance.
+
+```
+$ foreman dispatch --check 'test -f calc.py' \
+    --check 'python3 -c "import calc; assert calc.factorial(5)==120"' \
+    "Create calc.py with a function add(a,b) returning a+b."
+[PASS] test -f calc.py
+[FAIL] python3 -c "import calc; assert calc.factorial(5)==120"
+       AttributeError: module 'calc' has no attribute 'factorial'
+1/2 passed
+```
+
+`foreman escalate` re-runs the same brief one rung up — and that example is
+exactly when **not** to use it. The prompt asked for `add`; the criterion
+demanded `factorial`. Escalating reproduced the identical failure on
+`deepseek-v4-pro`, at higher cost. A stronger model cannot read a requirement
+that was never written.
+
+Diagnose first: a **spec defect** means fix the brief and re-dispatch at the
+same rung; only a genuine **capability limit** is worth a rung.
 
 ## Parallelism
 

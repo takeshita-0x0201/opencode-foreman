@@ -29,9 +29,13 @@ TASKS_FILE = os.path.join(STATE_DIR, "tasks.json")
 PID_FILE = os.path.join(STATE_DIR, "server.pid")
 WORKTREE_DIR = os.path.join(STATE_DIR, "worktrees")
 
+# Escalation ladder. `foreman escalate` re-runs a failed task at the next rung
+# with the same brief, so stepping up is a decision, not a rewrite.
+LADDER = ["flash", "pro", "max"]
 PROFILES = {
-    "pro": ("opencode-go", "deepseek-v4-pro"),
-    "flash": ("opencode-go", "deepseek-v4-flash"),
+    "flash": ("opencode-go", "deepseek-v4-flash"),   # bulk, mechanical, search
+    "pro": ("opencode-go", "deepseek-v4-pro"),       # default implementation
+    "max": ("opencode-go", "grok-4.5"),              # hardest tasks
 }
 DEFAULT_PROFILE = "pro"
 
@@ -41,7 +45,7 @@ STARTUP_GRACE = 5.0
 # Commands that talk to the server; these autostart it if it is not running.
 # `diff` and `clean` only touch git, so they work with the server down.
 NEEDS_SERVER = {"dispatch", "ls", "status", "wait", "result", "perms", "reply",
-                "abort", "revert"}
+                "abort", "revert", "escalate"}
 
 
 # --------------------------------------------------------------------------
@@ -434,8 +438,11 @@ def cmd_dispatch(args):
     tasks[task_id] = {
         "id": task_id, "session": sid, "dir": workdir, "source": source,
         "worktree": name, "model": f"{provider}/{model}",
+        "profile": args.profile if not args.model else None,
         "title": payload["title"], "created": time.time(),
-        "permission": ruleset,
+        "permission": ruleset, "prompt": prompt, "checks": list(args.check),
+        "deny": list(args.deny), "allow_bash": args.allow_bash,
+        "read_only": args.read_only,
     }
     save_tasks(tasks)
 
@@ -444,9 +451,16 @@ def cmd_dispatch(args):
     print(f"  dir       {workdir}")
     if ruleset:
         print(f"  denied    " + ", ".join(f"{r['permission']}:{r['pattern']}" for r in ruleset))
+    if args.check:
+        print(f"  checks    {len(args.check)} acceptance command(s)")
+    else:
+        print("  checks    none - nothing will verify this task's output",
+              file=sys.stderr)
     if args.wait:
         cmd_wait(argparse.Namespace(url=args.url, task=task_id, timeout=args.timeout))
         cmd_result(argparse.Namespace(url=args.url, task=task_id))
+        if args.check:
+            cmd_verify(argparse.Namespace(url=args.url, task=task_id))
 
 
 def session_busy(url: str, workdir: str, sid: str) -> bool:
@@ -564,6 +578,57 @@ def cmd_diff(args):
     print(out if out.strip() else "(no changes)")
 
 
+def cmd_verify(args):
+    """Run the task's acceptance checks. The executor's 'Done.' is a claim;
+    this is the evidence. Exits non-zero if any check fails."""
+    task = resolve(args.task)
+    checks = task.get("checks") or []
+    if not checks:
+        die(f"{task['id']} has no acceptance checks; it cannot be verified")
+    failed = []
+    for command in checks:
+        proc = subprocess.run(command, shell=True, cwd=task["dir"],
+                              capture_output=True, text=True)
+        ok = proc.returncode == 0
+        print(f"[{'PASS' if ok else 'FAIL'}] {command}")
+        if not ok:
+            failed.append(command)
+            tail = (proc.stdout + proc.stderr).strip().splitlines()
+            for line in tail[-8:]:
+                print(f"       {line}")
+    print(f"{len(checks) - len(failed)}/{len(checks)} passed")
+    if failed:
+        print(f"escalate with: foreman escalate {task['id']}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def cmd_escalate(args):
+    """Re-dispatch a task's brief at the next rung of the ladder.
+
+    Deliberately reuses the recorded prompt: if the brief was the problem,
+    fix the brief and dispatch again instead of escalating a bad spec.
+    """
+    task = resolve(args.task)
+    profile = task.get("profile")
+    if not profile:
+        die(f"{task['id']} pinned --model explicitly; re-dispatch with the model you want")
+    if profile not in LADDER:
+        die(f"unknown profile {profile!r}")
+    index = LADDER.index(profile)
+    if index + 1 >= len(LADDER):
+        die(f"{profile} is the top rung; hand this back to the orchestrator")
+    nxt = LADDER[index + 1]
+    print(f"escalating {task['id']}: {profile} -> {nxt}", file=sys.stderr)
+    cmd_dispatch(argparse.Namespace(
+        url=args.url, prompt=task["prompt"], file=None, dir=task["source"],
+        worktree=f"{task['id']}-{nxt}", profile=nxt, model=None, agent=None,
+        title=f"[{nxt}] {task['title']}", deny=task.get("deny", []),
+        read_only=task.get("read_only", False),
+        allow_bash=task.get("allow_bash", False),
+        check=task.get("checks", []), wait=args.wait, timeout=args.timeout,
+    ))
+
+
 def cmd_perms(args):
     task = resolve(args.task)
     pending = pending_permissions(args.url, task["session"])
@@ -626,8 +691,10 @@ def main():
     d.add_argument("--dir", default=".", help="repository or directory to work in")
     d.add_argument("--worktree", nargs="?", const="", default=None,
                    metavar="NAME", help="run in an isolated git worktree (default name: task id)")
-    d.add_argument("--profile", choices=sorted(PROFILES), default=DEFAULT_PROFILE,
-                   help=f"model profile (default {DEFAULT_PROFILE})")
+    d.add_argument("--profile", choices=LADDER, default=DEFAULT_PROFILE,
+                   help=f"ladder rung: {' -> '.join(LADDER)} (default {DEFAULT_PROFILE})")
+    d.add_argument("--check", action="append", default=[], metavar="CMD",
+                   help="acceptance command; must exit 0 (repeatable)")
     d.add_argument("--model", help="explicit provider/model, overrides --profile")
     d.add_argument("--agent", help="opencode agent to use")
     d.add_argument("--title", help="short label for foreman ls")
@@ -646,6 +713,7 @@ def main():
         ("status", cmd_status, "exit 0 if idle, 2 if still running"),
         ("result", cmd_result, "print the executor's final message"),
         ("diff", cmd_diff, "git diff of what the executor changed"),
+        ("verify", cmd_verify, "run the task's acceptance checks"),
         ("perms", cmd_perms, "list pending permission requests"),
         ("abort", cmd_abort, "stop a running session"),
         ("revert", cmd_revert, "ask opencode to roll back its edits"),
@@ -665,6 +733,12 @@ def main():
     r.add_argument("request_id")
     r.add_argument("response", choices=["once", "always", "reject"])
     r.set_defaults(fn=cmd_reply)
+
+    e = sub.add_parser("escalate", help="re-run a task's brief at the next ladder rung")
+    e.add_argument("task", nargs="?", default="last")
+    e.add_argument("--wait", action="store_true")
+    e.add_argument("--timeout", type=int, default=1800)
+    e.set_defaults(fn=cmd_escalate)
 
     agent = sub.add_parser("agent", help="run the server permanently in the background")
     agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)

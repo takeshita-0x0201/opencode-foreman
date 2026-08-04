@@ -1,73 +1,99 @@
 ---
 name: opencode-foreman
-description: Use when delegating implementation work to a cheaper executor model - dispatches self-contained coding tasks to OpenCode sessions via foreman, isolated per git worktree, then reviews the diff before anything lands
+description: Use when acting as PM over implementation work - hardens a request into a spec with executable acceptance criteria, dispatches it to an OpenCode Go model, verifies the result against those criteria rather than trusting the executor, and escalates by ladder when the model was the limit
 ---
 
-# Delegating implementation to OpenCode
+# Running implementation as PM
 
-You keep the plan and the review. OpenCode's executor model does the typing.
-Work lands only after you have read the diff.
+You hold the plan, the spec, and the verdict. An OpenCode Go model writes the
+code. Nothing lands on a real branch until you have checked it yourself.
 
-Delegate when the task is **mechanical and self-contained**: a scripted
-transformation, tests for an existing module, a bounded refactor, bulk
-classification, boilerplate. Do it yourself when the task needs cross-file
-reasoning, novel architecture, or touches anything irreversible.
+The discipline that makes this work is **the spec, not the model**. A cheap
+model executing a tight spec beats an expensive one guessing at a vague one.
 
-## Preflight
+## Step 1 — harden the requirement before dispatching
 
-None. `foreman` starts and reuses its own server. If the `foreman` command
-itself is missing, say so and stop — do not quietly fall back to editing the
-files yourself.
+Do not dispatch a request in the shape the user said it. Convert it first. A
+task is ready when you can answer all four:
 
-## The loop
+1. **Scope** — exactly which files may change, and which must not.
+2. **Behaviour** — what the code must do, in specifics, not adjectives.
+3. **Acceptance** — a command that exits 0 iff the task succeeded. If you
+   cannot write one, the requirement is still too vague; keep going.
+4. **Context** — the executor sees none of this conversation. Anything it
+   needs (existing function signatures, file layout, conventions) goes in the
+   prompt.
 
-**1. Write a self-contained prompt.** The executor gets none of this
-conversation. State the file paths, the expected behaviour, and how it can
-verify itself. Vague prompts are the main cause of unusable output.
+If the user's request cannot survive this, that is a finding. Bring the
+ambiguity back to them instead of dispatching a guess.
 
-**2. Dispatch.** Always isolate, always deny by default:
+Track the tasks with TodoWrite so the fan-out stays visible.
 
-```bash
-foreman dispatch --worktree --deny '<paths that must not change>' \
-  --profile pro "<the full task>"
-```
-
-- `--profile pro` for implementation, `--profile flash` for search,
-  classification, or high-volume mechanical passes.
-- `--allow-bash` only when the task genuinely needs to run tests or tooling.
-  It is off by default.
-- Add `--deny` for every path where a wrong edit would be expensive. The rule
-  is enforced by the server, and `dispatch` prints the ruleset actually in
-  force — read that line back and confirm it covers what you intended.
-
-**3. Do other work while it runs.** Dispatch returns immediately. Fan out with
-a loop when tasks are independent; each `--worktree` gets its own branch.
-
-**4. Collect.**
+## Step 2 — dispatch with the criteria attached
 
 ```bash
-foreman ls              # running / starting / idle
-foreman wait <id>       # or block
-foreman result <id>     # the executor's own summary — a claim, not evidence
-foreman diff <id>       # the actual change
+foreman dispatch --worktree --profile pro \
+  --deny 'apps/worker/**' \
+  --check 'test -f src/retry.py' \
+  --check 'python3 -m pytest tests/test_retry.py -q' \
+  "<the hardened spec>"
 ```
 
-If `wait` exits 3, a permission prompt is blocking it: `foreman perms <id>`,
-then `foreman reply <id> <requestID> once|reject`.
+- `--check` is repeatable and is the whole point. `dispatch` warns on stderr
+  when a task has none — treat that warning as a bug in your own spec, not as
+  noise.
+- `--deny` every path where a wrong edit is expensive. Read back the `denied`
+  line it prints and confirm it says what you meant.
+- `--worktree` always, for anything touching a real repo.
+- `--allow-bash` only when the task must run its own tests.
+- Rungs: `flash` (bulk, mechanical, search) → `pro` (default) → `max`
+  (hardest). `--model opencode-go/<id>` pins any of the 18 models directly;
+  `opencode models` lists them.
 
-**5. Review the diff yourself.** This is the point of the whole arrangement.
-`foreman result` is the executor asserting it succeeded; `foreman diff` is what
-it did. Check them against each other. Run the tests yourself.
+Independent tasks are a plain loop — dispatch returns immediately.
 
-**6. Land or discard.**
+## Step 3 — verify, do not believe
 
-- Good: merge the `foreman/<name>` branch, then `foreman clean <id>`.
-- Bad: `foreman clean <id>` throws the worktree and branch away. Prefer
-  re-dispatching with a sharper prompt over hand-patching a bad result — if
-  the prompt was wrong, fixing the output leaves the prompt wrong.
+```bash
+foreman wait <id>
+foreman verify <id>    # runs the checks; non-zero if any fail
+foreman diff <id>      # read this even when the checks pass
+```
 
-## Reporting back
+`foreman result` is the executor asserting it succeeded. `foreman verify` is
+evidence. They disagree more often than you would like — a model that says
+"Done." while a check fails is the normal case this workflow exists to catch.
 
-Tell the user which model ran it, what the diff actually contains, and what you
-verified. If you did not run the tests, say that. Never present the executor's
-"Done." as confirmation that the change is correct.
+Read the diff even on a green run: checks prove the criteria you thought of,
+not the ones you missed.
+
+## Step 4 — diagnose before escalating
+
+When `verify` fails, the failure is one of two kinds, and they need opposite
+responses:
+
+- **Spec defect** — the criteria demanded something the prompt never asked
+  for, context was missing, scope was ambiguous. **Fix the brief and dispatch
+  again at the same rung.** Escalating will reproduce the same failure at
+  higher cost; a stronger model cannot read a requirement that is not there.
+- **Capability limit** — the spec was complete and the model still could not
+  do it. Then, and only then: `foreman escalate <id>` re-runs the same brief
+  one rung up.
+
+Escalate at most once per task. If `max` fails on a complete spec, the task is
+mis-decomposed — take it back and split it, or implement it yourself.
+
+## Step 5 — land or discard
+
+- Pass: merge `foreman/<name>`, then `foreman clean <id>`.
+- Fail: `foreman clean <id>` discards the worktree and branch. Prefer
+  re-dispatching over hand-patching — patching the output leaves the defective
+  spec in place, and you will hit it again next task.
+- `foreman revert <id>` rolls back the executor's edits without touching the
+  task record.
+
+## Reporting
+
+Say which model ran it, what `verify` returned, and what you read in the diff.
+If a check was skipped or a criterion was untestable, say that explicitly.
+Never pass the executor's "Done." along as confirmation.
